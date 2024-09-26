@@ -5,8 +5,24 @@ import matplotlib.pyplot as plt
 from nnfs.datasets import sine_data, spiral_data
 import os 
 import cv2
+import pickle
+import copy
 
 nnfs.init()
+
+fashion_mnist_labels = {
+	0: 'T-shirt/top',
+	1: 'Trouser',
+	2: 'Pullover',
+	3: 'Dress',
+	4: 'Coat',
+	5: 'Sandal',
+	6: 'Shirt',
+	7: 'Sneaker',
+	8: 'Bag',
+	9: 'Ankle boot'
+}
+
 
 def load_mnist_dataset(dataset, path):
 
@@ -82,6 +98,18 @@ class Layer_Dense:
 			self.dbiases += 2 * self.bias_regularizer_l2 * self.biases
 
 		self.dinputs = np.dot(dvalues, self.weights.T)
+
+	def get_parameters(self):
+		parameters = []
+
+		for layer in self.trainable_layers:
+			parameters.append(layer.get_parameters)
+
+		return parameters
+
+	def set_parameters(self, weights, biases):
+		self.weights = weights
+		self.biases = biases
 
 class Activation_ReLU:
 	def forward(self, inputs, training):
@@ -170,7 +198,7 @@ class Loss:
 		self.trainable_layers = trainable_layers
 
 class Loss_CategoricalCrossentropy(Loss):
-	def forward(self, y_pred, y_true):`
+	def forward(self, y_pred, y_true):
 		samples = len(y_pred)
 		y_pred_clipped = np.clip(y_pred, 1e-7, 1 - 1e-7)
 
@@ -513,10 +541,13 @@ class Model:
 	def add(self, layer):
 		self.layers.append(layer)
 
-	def set(self, *, loss, optimizer, accuracy):
-		self.loss = loss 
-		self.optimizer = optimizer 
-		self.accuracy = accuracy 
+	def set(self, *, loss=None, optimizer=None, accuracy=None):
+		if loss is not None:
+			self.loss = loss 
+		if optimizer is not None:
+			self.optimizer = optimizer 
+		if accuracy is not None:
+			self.accuracy = accuracy 
 
 	def finalize(self):
 		self.input_layer = Layer_Input()
@@ -544,7 +575,8 @@ class Model:
 			if hasattr(self.layers[i], 'weights'):
 				self.trainable_layers.append(self.layers[i])
 
-			self.loss.remember_trainable_layers(self.trainable_layers)
+			if self.loss is not None:
+				self.loss.remember_trainable_layers(self.trainable_layers)
 
 		if isinstance(self.layers[-1], Activation_Softmax) and isinstance(self.loss, Loss_CategoricalCrossentropy):
 
@@ -678,47 +710,153 @@ class Model:
 		for layer in reversed(self.layers):
 			layer.backward(layer.next.dinputs)
 
+	def evaluate(self, X_val, y_val, *, batch_size=None):
+		validation_steps = 1
 
-X, y, X_test, y_test = create_data_mnist('fashion_mnist_images')
+		if batch_size is not None:
+			validation_steps = len(X_val) // batch_size
 
-# Shuffle the training dataset
-keys = np.array(range(X.shape[0]))
-np.random.shuffle(keys)
-X = X[keys]
-y = y[keys]
+			if validation_steps * batch_size < len(X_val):
+				validation_steps += 1
 
-# Scale and reshape samples
-X = (X.reshape(X.shape[0], -1).astype(np.float32) - 127.5) / 127.5
-X_test = (X_test.reshape(X_test.shape[0], -1).astype(np.float32) -
-             127.5) / 127.5
-# print(X[:10])
-# print(y[:10])
 
-# Instantiate the model
-model = Model()
+		self.loss.new_pass()
+		self.accuracy.new_pass()
 
-# Add layers
-model.add(Layer_Dense(X.shape[1], 128))
-model.add(Activation_ReLU())
-model.add(Layer_Dense(128, 128))
-model.add(Activation_ReLU())
-model.add(Layer_Dense(128, 10))
-model.add(Activation_Softmax())
+		for step in range(validation_steps):
+			if batch_size is None:
+				batch_X = X_val 
+				batch_y = y_val
 
-# Set loss, optimizer and accuracy objects
-model.set(
-    loss=Loss_CategoricalCrossentropy(),
-    optimizer=Optimizer_Adam(decay=1e-3),
-    accuracy=Accuracy_Categorical()
-)
+			else:
+				batch_X = X_val[step*batch_size:(step+1)*batch_size]
+				batch_y = y_val[step*batch_size:(step+1)*batch_size]
 
-# Finalize the model
-model.finalize()
+			output = self.forward(batch_X, training=False)
 
-# Train the model
-model.train(X, y, validation_data=(X_test, y_test),
-            epochs=10, batch_size=128, print_every=100)
+			self.loss.calculate(output, batch_y)
 
+			predictions = self.output_layer_activation.predictions(output)
+			self.accuracy.calculate(predictions, batch_y)
+
+		validation_loss = self.loss.calculate_accumulated()
+		validation_accuracy = self.accuracy.calculate_accumulated()
+
+		print(	f'validation, '+
+				f'acc: {validation_accuracy:.3f}, ' + 
+				f'loss: {validation_loss:.3f}')
+
+	def set_parameters(self, parameters):
+		for parameter_set, layer in zip(parameters, self.trainable_layers):
+			layer.set_parameters(*parameter_set)
+
+	def save_parameters(self, path):
+		with open(path, 'wb') as f:
+			pickle.dump(self.get_parameters(), f)
+
+	def load_parameters(self, path):
+		with open(path, 'rb') as f:
+			self.set_parameters(pickle.load(f))
+
+	def save(self, path):
+		model = copy.deepcopy(self)
+		model.loss.new_pass()
+		model.accuracy.new_pass()
+
+		model.input_layer.__dict__.pop('output', None)
+		model.loss.__dict__.pop('dinputs', None)
+
+		for layer in model.layers:
+			for property in ['inputs', 'outputs', 'dinputs', 'dweights', 'dbiases']:
+				layer.__dict__.pop(property, None)
+
+		with open(path, 'wb') as f:
+			pickle.dump(model, f)
+
+	def predict(self, X, *, batch_size=None):
+		prediction_steps = 1
+
+		if batch_size is not None:
+			prediction_steps = len(X) // batch_size
+
+			if prediction_steps * batch_size < len(X):
+				prediction_steps += 1
+
+		output = []
+
+		for step in range(prediction_steps):
+			if batch_size is None:
+				batch_X = X
+			else:
+				batch_X = X[step*batch_size:(step+1)*batch_size]
+
+			batch_output = self.forward(batch_X, training=False)
+
+			output.append(batch_output)
+
+		return np.vstack(output)
+
+	@staticmethod
+	def load(path):
+		with open(path, 'rb') as f:
+			model = pickle.load(f)
+
+		return model
+
+
+
+# X, y, X_test, y_test = create_data_mnist('fashion_mnist_images')
+
+# # Shuffle
+# keys = np.array(range(X.shape[0]))
+# np.random.shuffle(keys)
+# X = X[keys]
+# y = y[keys]
+
+# # Scale and reshape 
+# X = (X.reshape(X.shape[0], -1).astype(np.float32) - 127.5) / 127.5
+# X_test = (X_test.reshape(X_test.shape[0], -1).astype(np.float32) -
+#              127.5) / 127.5
+
+
+# model = Model()
+
+
+# model.add(Layer_Dense(X.shape[1], 128))
+# model.add(Activation_ReLU())
+# model.add(Layer_Dense(128, 128))
+# model.add(Activation_ReLU())
+# model.add(Layer_Dense(128, 10))
+# model.add(Activation_Softmax())
+
+
+# model.set(
+#     loss=Loss_CategoricalCrossentropy(),
+#     optimizer=Optimizer_Adam(learning_rate=0.001, decay=1e-3),
+#     accuracy=Accuracy_Categorical()
+# )
+
+
+# model.finalize()
+
+# model.train(X, y, epochs=10, batch_size=128, print_every=100)
+
+# model.save('fashion_mnist.model')
+
+image_data = cv2.imread('test.png', cv2.IMREAD_GRAYSCALE)
+image_data = cv2.resize(image_data, (28,28))
+
+image_data = 255 - image_data
+image_data = (image_data.reshape(1, -1).astype(np.float32) - 127.5) / 127.5
+
+
+model = Model.load('fashion_mnist.model')
+
+confidences = model.predict(image_data)
+predictions = model.output_layer_activation.predictions(confidences)
+
+for prediction in predictions:
+	print(fashion_mnist_labels[prediction])
 
 
 

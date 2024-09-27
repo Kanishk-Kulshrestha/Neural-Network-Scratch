@@ -1,5 +1,7 @@
 A Neural Network Built from scratch with only NumPy and trained on fashion MNIST 
 
+Either you can train the model yourself, or simply load the pre-trained model (fashion_mnist.model) to save time and resources.
+
 
 LICENSE
 =================
